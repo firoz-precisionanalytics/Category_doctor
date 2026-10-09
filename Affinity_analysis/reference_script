@@ -1,0 +1,47 @@
+
+
+query = """
+
+select 
+    voucher_date,
+    DEPTNAME, 
+   -- category_name, 
+     
+    sum(pamount) as sales,
+    count(distinct voucher_id) as bills, 
+    sum(issue_quantity) as units, 
+    sum(CASE
+    WHEN NULLIF(TRIM(card_holder_name), '') IS NULL THEN 0
+    ELSE pamount
+    END) AS card_sales, 
+    sum(cost_rate * issue_quantity) as cost
+    
+
+FROM 
+(
+SELECT *
+FROM DMCHM2627.dbo.datatransfersales
+
+UNION ALL
+
+SELECT *
+FROM DMCHM2526.dbo.datatransfersales
+
+UNION ALL
+
+SELECT *
+FROM DMCHM2425.dbo.datatransfersales
+
+)  A 
+
+LEFT JOIN DMCHM2627.dbo.datatransferItem_codes B 
+ON A.item_code = B.item_code 
+
+
+group by voucher_date, DEPTNAME
+--, category_name
+"""
+
+
+
+df = pd.read_sql(query, conn)
