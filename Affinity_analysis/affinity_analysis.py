@@ -28,7 +28,7 @@ ITEM_MASTER_TABLE = "datatransferItem_codes"
 # Rules must meet every threshold below.  Tune these after reviewing the
 # first extract: lower thresholds yield more rules, but can be noisier.
 MIN_PAIR_TRANSACTIONS = 5
-MIN_SUPPORT = 0.01
+MIN_SUPPORT = 0.0005
 MIN_CONFIDENCE = 0.10
 
 OUTPUT_FILE = Path(__file__).with_name("affinity_rules_full.csv")
@@ -65,20 +65,34 @@ def find_item_description_column(connection) -> str | None:
     return None
 
 
+def create_basket_items(connection, max_sales_rows: int | None) -> None:
+    """Materialize baskets once; local temp tables require this same connection."""
+    databases = SALES_DATABASES[:1] if max_sales_rows else SALES_DATABASES
+    top = f"TOP ({max_sales_rows}) " if max_sales_rows else ""
+    sources = " UNION ALL ".join(
+        f"""SELECT {top}'{database}' AS source_database, voucher_id,
+                    LTRIM(RTRIM(CAST(item_code AS varchar(100)))) AS item_code
+             FROM {quote_identifier(database)}.dbo.{quote_identifier(TRANSACTION_TABLE)}
+             WHERE voucher_id IS NOT NULL AND item_code IS NOT NULL AND issue_quantity > 0"""
+        for database in databases
+    )
+    cursor = connection.cursor()
+    cursor.execute(
+        f"""SELECT source_database, voucher_id, item_code INTO #BasketItems
+             FROM ({sources}) AS sales_lines
+             GROUP BY source_database, voucher_id, item_code;"""
+    )
+    while cursor.nextset():
+        pass
+    cursor.execute(
+        "CREATE UNIQUE CLUSTERED INDEX IX_BasketItems "
+        "ON #BasketItems (source_database, voucher_id, item_code);"
+    )
+    cursor.close()
+
+
 def build_query(description_column: str | None, max_sales_rows: int | None = None) -> str:
     """Build SQL that aggregates item pairs without loading raw sales lines."""
-    source_databases = SALES_DATABASES[:1] if max_sales_rows else SALES_DATABASES
-    row_limit = f"TOP ({max_sales_rows}) " if max_sales_rows else ""
-    sales_sources = "\n        UNION ALL\n        ".join(
-        f"""SELECT {row_limit}'{database}' AS source_database,
-                   voucher_id,
-                   LTRIM(RTRIM(CAST(item_code AS varchar(100)))) AS item_code
-            FROM {quote_identifier(database)}.dbo.{quote_identifier(TRANSACTION_TABLE)}
-            WHERE voucher_id IS NOT NULL
-              AND item_code IS NOT NULL
-              AND issue_quantity > 0"""
-        for database in source_databases
-    )
 
     if description_column:
         item_label_expression = (
@@ -88,44 +102,26 @@ def build_query(description_column: str | None, max_sales_rows: int | None = Non
     else:
         item_label_expression = "item_code"
 
-    sample_transactions = """SELECT source_database, voucher_id
-        FROM RawSalesLines
-        GROUP BY source_database, voucher_id"""
-
     return f"""
-    WITH RawSalesLines AS (
-        {sales_sources}
-    ),
-    SampleTransactions AS (
-        {sample_transactions}
-    ),
-    BasketItems AS (
-        SELECT sales_lines.source_database, sales_lines.voucher_id, sales_lines.item_code
-        FROM RawSalesLines AS sales_lines
-        INNER JOIN SampleTransactions AS sampled_transactions
-            ON sampled_transactions.source_database = sales_lines.source_database
-           AND sampled_transactions.voucher_id = sales_lines.voucher_id
-        GROUP BY sales_lines.source_database, sales_lines.voucher_id, sales_lines.item_code
-    ),
-    TotalTransactions AS (
+    WITH TotalTransactions AS (
         SELECT COUNT(*) AS transaction_count
         FROM (
             SELECT source_database, voucher_id
-            FROM BasketItems
+            FROM #BasketItems
             GROUP BY source_database, voucher_id
         ) AS transactions
     ),
     ItemCounts AS (
         SELECT item_code, COUNT(*) AS item_transaction_count
-        FROM BasketItems
+        FROM #BasketItems
         GROUP BY item_code
     ),
     PairCounts AS (
         SELECT left_item.item_code AS item_a_code,
                right_item.item_code AS item_b_code,
                COUNT(*) AS pair_transaction_count
-        FROM BasketItems AS left_item
-        INNER JOIN BasketItems AS right_item
+        FROM #BasketItems AS left_item
+        INNER JOIN #BasketItems AS right_item
             ON right_item.source_database = left_item.source_database
            AND right_item.voucher_id = left_item.voucher_id
            AND right_item.item_code > left_item.item_code
@@ -206,6 +202,7 @@ def build_query(description_column: str | None, max_sales_rows: int | None = Non
     LEFT JOIN ItemMaster AS item_a ON item_a.item_code = metrics.item_a_code
     LEFT JOIN ItemMaster AS item_b ON item_b.item_code = metrics.item_b_code
     WHERE metrics.confidence_b_to_a >= ?
+    OPTION (RECOMPILE, MAXDOP 1, MAX_GRANT_PERCENT = 10)
     """
 
 
@@ -222,6 +219,7 @@ def main() -> None:
 
     with get_connection() as connection:
         description_column = find_item_description_column(connection)
+        create_basket_items(connection, args.sample_rows)
         query = build_query(description_column, args.sample_rows)
         rules = pd.read_sql_query(
             query,
